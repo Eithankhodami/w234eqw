@@ -1,76 +1,59 @@
 import os
 import json
-import sys
+import base64
 import logging
 import gspread
-from google.oauth2.service_account import Credentials
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from flask import Flask, request
+from telegram import Update, Bot
+from telegram.ext import CommandHandler, Dispatcher, CallbackContext
 
-# Enable logging
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
+# Decode and set up Google credentials
+if "GOOGLE_CREDS_B64" in os.environ:
+    creds_b64 = os.environ["GOOGLE_CREDS_B64"]
+    creds_json = base64.b64decode(creds_b64).decode("utf-8")
+    with open("credentials.json", "w") as f:
+        f.write(creds_json)
+else:
+    print("❌ GOOGLE_CREDS_B64 is missing in the environment.")
+    print("🔍 Available environment variables:", list(os.environ.keys()))
+    raise RuntimeError("GOOGLE_CREDS_B64 not found. Deployment aborted.")
 
-# === Load environment variables ===
+gc = gspread.service_account(filename="credentials.json")
+sheet = gc.open("Spendings").sheet1  # Adjust if your sheet has a different name
 
-# Get Google credentials from environment
-GOOGLE_CREDS_ENV = os.environ.get("GOOGLE_CREDS_JSON")
+# Set up Flask and Telegram bot
+app = Flask(__name__)
+bot = Bot(token=os.environ["TOKEN"])
+dispatcher = Dispatcher(bot, None, workers=0)
 
-if not GOOGLE_CREDS_ENV:
-    print("❌ GOOGLE_CREDS_JSON is missing in the environment.", file=sys.stderr)
-    print("🔍 Available environment variables:", list(os.environ.keys()), file=sys.stderr)
-    raise RuntimeError("GOOGLE_CREDS_JSON not found. Deployment aborted.")
+# Define /start command
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text("Welcome to SpendBot! Send your expense in the format:\n`Coffee 3.5`")
 
-# Parse credentials and set up Google Sheets
-creds_info = json.loads(GOOGLE_CREDS_ENV)
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-creds = Credentials.from_service_account_info(creds_info, scopes=SCOPES)
-client = gspread.authorize(creds)
-sheet = client.open("Secondment Sheet").sheet1
-
-# === Telegram Bot Handlers ===
-
-# /start handler
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info("✅ Received /start command from %s", update.effective_user.username)
-    await update.message.reply_text(
-        "Hi! Send your expense in this format:\n"
-        "2025-04-04, Berlin, 15.50, Food, R123, work, upload_later"
-    )
-
-# Text message handler for adding data
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    logger.info("📥 Received message: %s", text)
-    parts = [x.strip() for x in text.split(",")]
-    
-    if len(parts) != 7:
-        await update.message.reply_text("⚠️ Invalid format. Please send 7 comma-separated values.")
-        return
-
+# Define handler for messages
+def handle_message(update: Update, context: CallbackContext):
     try:
-        sheet.append_row(parts)
-        await update.message.reply_text("✅ Expense recorded.")
+        parts = update.message.text.strip().split(" ", 1)
+        item = parts[0]
+        cost = float(parts[1])
+        sheet.append_row([item, cost])
+        update.message.reply_text(f"✅ Logged: {item} - ${cost}")
     except Exception as e:
-        logger.error("❌ Failed to append to sheet: %s", e)
-        await update.message.reply_text("❌ Failed to record expense. Please try again.")
+        update.message.reply_text("⚠️ Please use format: `Item 9.99`")
 
-# === Main bot entry ===
+# Register handlers
+dispatcher.add_handler(CommandHandler("start", start))
+dispatcher.add_handler(CommandHandler("help", start))
+dispatcher.add_handler(CommandHandler("expense", handle_message))
 
+# Set up webhook endpoint
+@app.route(f"/{os.environ['TOKEN']}", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), bot)
+    dispatcher.process_update(update)
+    return "ok"
+
+# For Railway, use this PORT
 if __name__ == "__main__":
-    TOKEN = os.environ.get("TOKEN")
-
-    if not TOKEN:
-        print("❌ TOKEN not set in environment variables.", file=sys.stderr)
-        sys.exit(1)
-
-    app = ApplicationBuilder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-
-    logger.info("🚀 Bot is running via polling...")
-    app.run_polling()
+    PORT = int(os.environ.get("PORT", "8080"))
+    app.run(host="0.0.0.0", port=PORT)
